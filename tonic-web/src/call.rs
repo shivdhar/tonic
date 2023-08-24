@@ -5,7 +5,7 @@ use std::task::{Context, Poll};
 use base64::Engine as _;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures_core::ready;
-use http::{header, HeaderMap, HeaderValue};
+use http::{header, HeaderMap, HeaderName, HeaderValue};
 use http_body::{Body, SizeHint};
 use pin_project::pin_project;
 use tokio_stream::Stream;
@@ -43,8 +43,9 @@ const GRPC_WEB_TRAILERS_BIT: u8 = 0b10000000;
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 enum Direction {
-    Request,
-    Response,
+    Decode,
+    Encode,
+    Empty,
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
@@ -53,35 +54,78 @@ pub(crate) enum Encoding {
     None,
 }
 
+/// HttpBody adapter for the grpc web based services.
+#[derive(Debug)]
 #[pin_project]
-pub(crate) struct GrpcWebCall<B> {
+pub struct GrpcWebCall<B> {
     #[pin]
     inner: B,
     buf: BytesMut,
     direction: Direction,
     encoding: Encoding,
     poll_trailers: bool,
+    client: bool,
+    trailers: Option<HeaderMap>,
+}
+
+impl<B: Default> Default for GrpcWebCall<B> {
+    fn default() -> Self {
+        Self {
+            inner: Default::default(),
+            buf: Default::default(),
+            direction: Direction::Empty,
+            encoding: Encoding::None,
+            poll_trailers: Default::default(),
+            client: Default::default(),
+            trailers: Default::default(),
+        }
+    }
 }
 
 impl<B> GrpcWebCall<B> {
     pub(crate) fn request(inner: B, encoding: Encoding) -> Self {
-        Self::new(inner, Direction::Request, encoding)
+        Self::new(inner, Direction::Decode, encoding)
     }
 
     pub(crate) fn response(inner: B, encoding: Encoding) -> Self {
-        Self::new(inner, Direction::Response, encoding)
+        Self::new(inner, Direction::Encode, encoding)
+    }
+
+    pub(crate) fn client_request(inner: B) -> Self {
+        Self::new_client(inner, Direction::Encode, Encoding::None)
+    }
+
+    pub(crate) fn client_response(inner: B) -> Self {
+        Self::new_client(inner, Direction::Decode, Encoding::None)
+    }
+
+    fn new_client(inner: B, direction: Direction, encoding: Encoding) -> Self {
+        GrpcWebCall {
+            inner,
+            buf: BytesMut::with_capacity(match (direction, encoding) {
+                (Direction::Encode, Encoding::Base64) => BUFFER_SIZE,
+                _ => 0,
+            }),
+            direction,
+            encoding,
+            poll_trailers: true,
+            client: true,
+            trailers: None,
+        }
     }
 
     fn new(inner: B, direction: Direction, encoding: Encoding) -> Self {
         GrpcWebCall {
             inner,
             buf: BytesMut::with_capacity(match (direction, encoding) {
-                (Direction::Response, Encoding::Base64) => BUFFER_SIZE,
+                (Direction::Encode, Encoding::Base64) => BUFFER_SIZE,
                 _ => 0,
             }),
             direction,
             encoding,
             poll_trailers: true,
+            client: false,
+            trailers: None,
         }
     }
 
@@ -192,12 +236,36 @@ where
     type Error = Status;
 
     fn poll_data(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
+        // Client side is reverse
+        if self.client && self.direction == Direction::Decode {
+            let buf = ready!(self.as_mut().poll_decode(cx));
+
+            return if let Some(Ok(mut buf)) = buf {
+                if let Some(len) = dbg!(find_trailers(&buf[..])) {
+                    let msg_buf = buf.copy_to_bytes(len);
+                    let trailers = decode_trailers_frame(buf);
+                    self.project().trailers.replace(trailers);
+
+                    if msg_buf.has_remaining() {
+                        return Poll::Ready(Some(Ok(msg_buf)));
+                    } else {
+                        return Poll::Ready(None);
+                    }
+                }
+
+                Poll::Ready(Some(Ok(buf)))
+            } else {
+                Poll::Ready(buf)
+            };
+        }
+
         match self.direction {
-            Direction::Request => self.poll_decode(cx),
-            Direction::Response => self.poll_encode(cx),
+            Direction::Decode => self.poll_decode(cx),
+            Direction::Encode => self.poll_encode(cx),
+            Direction::Empty => Poll::Ready(None),
         }
     }
 
@@ -205,7 +273,8 @@ where
         self: Pin<&mut Self>,
         _: &mut Context<'_>,
     ) -> Poll<Result<Option<HeaderMap<HeaderValue>>, Self::Error>> {
-        Poll::Ready(Ok(None))
+        let trailers = self.project().trailers.take();
+        Poll::Ready(Ok(trailers))
     }
 
     fn is_end_stream(&self) -> bool {
@@ -268,6 +337,43 @@ fn encode_trailers(trailers: HeaderMap) -> Vec<u8> {
     })
 }
 
+fn decode_trailers_frame(mut buf: Bytes) -> HeaderMap {
+    buf.get_u8();
+    buf.get_u32();
+
+    let mut map = HeaderMap::new();
+    let mut buf2 = buf.clone();
+
+    let mut trailers = Vec::new();
+    let mut cursor_pos = 0;
+
+    for (i, b) in buf.iter().enumerate() {
+        if b == &b'\r' && buf.get(i + 1) == Some(&b'\n') {
+            let trailer = buf2.copy_to_bytes(i - cursor_pos);
+            cursor_pos = i;
+            trailers.push(trailer);
+            if buf2.has_remaining() {
+                buf2.get_u8();
+                buf2.get_u8();
+            }
+        }
+    }
+
+    for trailer in trailers {
+        let mut s = trailer.split(|b| b == &b':');
+        let key = s.next().unwrap();
+        let value = s.next().unwrap();
+
+        let value = value.split(|b| b == &b'\r').next().unwrap();
+
+        let header_key = HeaderName::try_from(key).unwrap();
+        let header_value = HeaderValue::try_from(value).unwrap();
+        map.insert(header_key, header_value);
+    }
+
+    map
+}
+
 fn make_trailers_frame(trailers: HeaderMap) -> Vec<u8> {
     let trailers = encode_trailers(trailers);
     let len = trailers.len();
@@ -279,6 +385,27 @@ fn make_trailers_frame(trailers: HeaderMap) -> Vec<u8> {
     frame.extend(trailers);
 
     frame
+}
+
+fn find_trailers(buf: &[u8]) -> Option<usize> {
+    let mut len = 0;
+    let mut buf1 = &buf[..];
+
+    loop {
+        if buf.is_empty() {
+            return None;
+        }
+
+        let header = buf1.get_u8();
+
+        if header == GRPC_WEB_TRAILERS_BIT {
+            return Some(len);
+        }
+
+        let msg_len = buf1.get_u32() as usize;
+        len += msg_len + 4 + 1;
+        buf1 = &buf[len as usize..];
+    }
 }
 
 #[cfg(test)]
@@ -304,5 +431,41 @@ mod tests {
             assert_eq!(Encoding::from_content_type(&headers), case.1, "{}", case.0);
             assert_eq!(Encoding::from_accept(&headers), case.1, "{}", case.0);
         }
+    }
+
+    #[test]
+    fn decode_trailers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("grpc-status", 0.try_into().unwrap());
+        headers.insert("grpc-message", "this is a message".try_into().unwrap());
+
+        let trailers = make_trailers_frame(headers.clone());
+
+        let buf = Bytes::from(trailers);
+
+        let map = decode_trailers_frame(buf);
+
+        assert_eq!(headers, map);
+    }
+
+    #[test]
+    fn find_trailers_fixture() {
+        // Byte version of this:
+        // b"\0\0\0\0L\n$975738af-1a17-4aea-b887-ed0bbced6093\x1a$da609e9b-f470-4cc0-a691-3fd6a005a436\x80\0\0\0\x0fgrpc-status:0\r\n"
+        let buf = vec![
+            0, 0, 0, 0, 76, 10, 36, 57, 55, 53, 55, 51, 56, 97, 102, 45, 49, 97, 49, 55, 45, 52,
+            97, 101, 97, 45, 98, 56, 56, 55, 45, 101, 100, 48, 98, 98, 99, 101, 100, 54, 48, 57,
+            51, 26, 36, 100, 97, 54, 48, 57, 101, 57, 98, 45, 102, 52, 55, 48, 45, 52, 99, 99, 48,
+            45, 97, 54, 57, 49, 45, 51, 102, 100, 54, 97, 48, 48, 53, 97, 52, 51, 54, 128, 0, 0, 0,
+            15, 103, 114, 112, 99, 45, 115, 116, 97, 116, 117, 115, 58, 48, 13, 10,
+        ];
+
+        let out = find_trailers(&buf[..]);
+
+        assert_eq!(out, Some(81));
+
+        let trailers = decode_trailers_frame(Bytes::copy_from_slice(&buf[81..]));
+        let status = trailers.get("grpc-status").unwrap();
+        assert_eq!(status.to_str().unwrap(), "0")
     }
 }
