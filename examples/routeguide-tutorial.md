@@ -34,6 +34,11 @@ To run the sample code and walk through the tutorial, the only prerequisite is R
 
 [rustup]: https://rustup.rs
 
+Note: You'll also need to install the Protobuf Compiler -- *and* header files (`protobuf-devel` on rpm-based systems and `protobuf-dev` on apt-based systems if installing via package manager) -- to compile the .proto files in the tutorial.
+Installation instructions for the Protobuf Compiler can be found in the [official docs].
+
+[official docs]: https://grpc.io/docs/protoc-installation/
+
 ## Running the example
 
 Clone or download Tonic's repository:
